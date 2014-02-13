@@ -3,9 +3,13 @@ from datetime import datetime, timedelta
 import pymongo
 import json
 from urlparse import parse_qs, urlparse
-from bson import json_util
+from urllib import unquote
+from bson import json_util, code
 import xlwt
 from cStringIO import StringIO
+from itertools import groupby
+from operator import itemgetter
+from lookups import OK_FIELDS, OK_FILTERS, WORKSHEET_COLUMNS, TYPE_GROUPS
 
 from flask import Flask, request, make_response
 from raven.contrib.flask import Sentry
@@ -14,69 +18,26 @@ app = Flask(__name__)
 
 app.url_map.strict_slashes = False
 
-app.config['SENTRY_DSN'] = 'https://0b2a28d91b324689b12ca36f747af10e:40bf5ac282da4ecfbc4b123d147e0749@app.getsentry.com/8349'
-sentry = Sentry(app)
+env = os.environ.get('PROJECTENV')
 
-c = pymongo.MongoClient()
+DEBUG = False
+
+if env == 'local':
+    c = pymongo.MongoClient(host=os.environ['CRIME_MONGO'])
+    DEBUG = True
+else:
+    c = pymongo.MongoClient()
+    app.config['SENTRY_DSN'] = os.environ['SENTRY_URL']
+    sentry = Sentry(app)
 db = c['chicago']
 db.authenticate(os.environ['CHICAGO_MONGO_USER'], os.environ['CHICAGO_MONGO_PW'])
 crime_coll = db['crime']
 iucr_coll = db['iucr']
 
-OK_FIELDS = [
-    'year', 
-    'domestic', 
-    'case_number', 
-    'id', 
-    'primary_type', 
-    'district', 
-    'arrest', 
-    'location', 
-    'community_area', 
-    'description', 
-    'beat', 
-    'date', 
-    'ward', 
-    'iucr', 
-    'location_description', 
-    'updated_on', 
-    'fbi_code', 
-    'block',
-    'type'
-]
-
-OK_FILTERS = [
-    'lt',
-    'lte',
-    'gt',
-    'gte',
-    'near',
-    'geoWithin',
-    'geoIntersects',
-    'in',
-    'all',
-    'ne',
-    'nin',
-    None,
-]
-
-WORKSHEET_COLUMNS = [
-    'date',
-    'primary_type',
-    'description',
-    'iucr',
-    'case_number',
-    'block',
-    'ward',
-    'community_area',
-    'beat',
-    'district',
-]
-
 @app.route('/api/report/', methods=['GET'])
 def crime_report():
-    get = request.args
-    query = json_util.loads(get['query'])
+    query = urlparse(request.url).query.replace('query=', '')
+    query = json_util.loads(unquote(query))
     results = list(crime_coll.find(query).hint([('date', -1)]))
     book = xlwt.Workbook()
     types = ', '.join(query['type']['$in'])
@@ -97,6 +58,8 @@ def crime_report():
                 value = ''
             if type(value) == datetime:
                 value = result[key].strftime('%Y-%m-%d')
+            if key == 'time_of_day':
+                value = result['date'].strftime('%H:%M')
             sheet.write(i, j, value)
     out = StringIO()
     book.save(out)
@@ -114,20 +77,32 @@ def crime_list():
     get = request.args.copy()
     callback = get.get('callback', None)
     maxDistance = get.get('maxDistance', 1000)
-    limit = get.get('limit', 1000)
-    if limit > 1000:
-        limit = 1000
+    limit = int(get.get('limit', 2000))
+    resp_format = get.get('format', 'jsonp')
+    if limit > 2000:
+        limit = 2000
     if not callback:
-        resp_packet = {
+        resp = {
             'status': 'Bad Request', 
-            'message': 'You must provide the name of a callback'
+            'message': 'You must provide the name of a callback',
+            'code': 400
         }
-        resp = make_response(json.dumps(resp_packet), 401)
     else:
         del get['callback']
         try:
             del get['_']
+        except KeyError:
+            pass
+        try:
             del get['maxDistance']
+        except KeyError:
+            pass
+        try:
+            del get['limit']
+        except KeyError:
+            pass
+        try:
+            del get['format']
         except KeyError:
             pass
         query = {}
@@ -165,22 +140,47 @@ def crime_list():
                     query[field] = {'$%s' % filt: {'$geometry': json.loads(value)}}
                     if filt == 'near':
                         query[field]['$%s' % filt]['$maxDistance'] = maxDistance
-                elif field == 'fbi_code':
-                    query['fbi_code'] = {'$in': value.split(',')}
-                elif field == 'type':
-                    query['type'] = {'$in': value.split(',')}
+                elif field in ['fbi_code', 'iucr', 'type', 'primary_type', 'beat']:
+                    query[field] = {'$in': value.split(',')}
+                elif field == 'location_description':
+                    groups = value.split(',')
+                    vals = []
+                    for group in groups:
+                        vals.extend(TYPE_GROUPS[group])
+                    query['location_description'] = {'$in': vals}
+                elif field == 'time':
+                    try:
+                        time_range = sorted(list(set([int(v) for v in value.split(',')])))
+                        times = time_range[0], time_range[-1]
+                        query['$where'] = code.Code('this.date.getHours() > %s && this.date.getHours() < %s' % times)
+                    except ValueError:
+                        # Someone unchecked all the boxes
+                        pass
                 elif filt:
                     if query.has_key(field):
                         update = {'$%s' % filt: value}
                         query[field].update(**update)
                     else:
-                        query[field] = {'$%s' % filt:value}
+                        query[field] = {'$%s' % filt: value}
                 else:
                     query[field] = value
         if not query.has_key('date'):
             query['date'] = {'$gte': datetime.now() - timedelta(days=14)}
+        if not query.has_key('type'):
+            query['type'] = {'$in': ['violent', 'property', 'quality']}
         if not resp:
             results = list(crime_coll.find(query).hint([('date', -1)]).limit(limit))
+            results = sorted(results, key=itemgetter('type'))
+            totals_by_type = {}
+            totals_by_date = {}
+            for k,g in groupby(results, key=itemgetter('type')):
+                totals_by_type[k] = len(list(g))
+            results = sorted(results, key=itemgetter('date'))
+            for k,g in groupby(results, key=itemgetter('date')):
+                key = k.strftime('%Y-%m-%d')
+                count = len(list(g))
+                stored_count = totals_by_date.get(key, 0)
+                totals_by_date[key] = stored_count + count
             resp = {
                 'status': 'ok', 
                 'results': results,
@@ -188,12 +188,18 @@ def crime_list():
                 'meta': {
                     'total_results': len(results),
                     'query': query,
+                    'totals_by_type': totals_by_type,
+                    'totals_by_date': totals_by_date,
                 }
             }
         if resp['code'] == 200:
-            out = make_response('%s(%s)' % (callback, json_util.dumps(resp)), resp['code'])
+            if resp_format == 'jsonp':
+                out = make_response('%s(%s)' % (callback, json_util.dumps(resp)), resp['code'])
+            else:
+                out = make_response(json_util.dumps(resp), resp['code'])
         else:
-            sentry.captureMessage(resp)
+            if not DEBUG:
+                sentry.captureMessage(resp)
             out = make_response(json.dumps(resp), resp['code'])
         return out
 
